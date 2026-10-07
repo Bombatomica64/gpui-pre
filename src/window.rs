@@ -1281,6 +1281,9 @@ pub struct Window {
     pub(crate) window_profiler: profiler::WindowProfiler,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
+    /// Set while a scroll step recognized from a touch pan is being
+    /// dispatched, so scroll containers can tell it from a mouse wheel.
+    pub(crate) dispatching_touch_scroll: bool,
     touch_prediction_enabled: bool,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
@@ -2183,6 +2186,7 @@ impl Window {
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             last_input_modality: InputModality::Mouse,
+            dispatching_touch_scroll: false,
             touch_gestures: TouchGestureRecognizer::new(
                 cx.platform
                     .gestures()
@@ -5860,7 +5864,9 @@ impl Window {
             RecognizedTouchGesture::Scroll(scroll_wheel) => {
                 self.mouse_position = scroll_wheel.position;
                 cx.propagate_event = true;
+                self.dispatching_touch_scroll = true;
                 self.dispatch_mouse_event(&scroll_wheel, cx);
+                self.dispatching_touch_scroll = false;
             }
             RecognizedTouchGesture::Tap { down, up } => {
                 self.mouse_position = up.position;
