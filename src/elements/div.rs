@@ -25,6 +25,7 @@ use crate::{
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
     PinchEvent, Pixels, Point, Render, ScrollEvent, SharedString, Size, Style, StyleRefinement,
     Styled, Task, TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
+TouchDragEvent,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -2668,7 +2669,26 @@ impl Interactivity {
                                             }
                                         }
 
+                                        // Touch drags of draggable children yield to
+                                        // scrolling along the axes this element scrolls.
+                                        let scrollable_axes = window.scrollable_axes;
+                                        if self.scroll_offset.is_some() {
+                                            let scrolls = |overflow, content, bounds| {
+                                                overflow == Overflow::Scroll && content > bounds
+                                            };
+                                            window.scrollable_axes.x |= scrolls(
+                                                style.overflow.x,
+                                                self.content_size.width,
+                                                bounds.size.width,
+                                            );
+                                            window.scrollable_axes.y |= scrolls(
+                                                style.overflow.y,
+                                                self.content_size.height,
+                                                bounds.size.height,
+                                            );
+                                        }
                                         f(&style, window, cx);
+                                        window.scrollable_axes = scrollable_axes;
 
                                         if let Some(_hitbox) = hitbox {
                                             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -3030,6 +3050,23 @@ impl Interactivity {
                         }
                     }
                 });
+
+                if drag_listener.is_some() {
+                    // Let a touch starting here drag this element through the
+                    // mouse drag path, unless an element in front claimed it.
+                    let hitbox = hitbox.clone();
+                    let scrollable_axes = window.scrollable_axes;
+                    window.on_mouse_event(move |event: &TouchDragEvent, phase, window, _cx| {
+                        if phase == DispatchPhase::Bubble
+                            && event.phase == TouchPhase::Started
+                            && !window.default_prevented()
+                            && window.mouse_drag_scroll_axes.is_none()
+                            && hitbox.is_hovered(window)
+                        {
+                            window.mouse_drag_scroll_axes = Some(scrollable_axes);
+                        }
+                    });
+                }
 
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
