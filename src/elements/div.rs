@@ -3341,6 +3341,10 @@ impl Interactivity {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let mut delta = event.delta.pixel_delta(line_height);
+                    // A wheel's delta may stand in for the other axis when
+                    // this container only scrolls one way; a finger moving
+                    // sideways means sideways, so touch pans never remap.
+                    let remap_axis = !restrict_scroll_to_axis && !window.dispatching_touch_scroll;
 
                     if restrict_scroll_to_axis
                         && event.delta.precise()
@@ -3353,20 +3357,12 @@ impl Interactivity {
 
                     let mut delta_x = match overflow.x {
                         Overflow::Scroll if !delta.x.is_zero() => delta.x,
-                        Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll =>
-                        {
-                            delta.y
-                        }
+                        Overflow::Scroll if remap_axis && overflow.y != Overflow::Scroll => delta.y,
                         _ => Pixels::ZERO,
                     };
                     let mut delta_y = match overflow.y {
                         Overflow::Scroll if !delta.y.is_zero() => delta.y,
-                        Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll =>
-                        {
-                            delta.x
-                        }
+                        Overflow::Scroll if remap_axis && overflow.x != Overflow::Scroll => delta.x,
                         _ => Pixels::ZERO,
                     };
                     if !allow_concurrent_scroll && !delta_x.is_zero() && !delta_y.is_zero() {
@@ -5597,6 +5593,95 @@ mod tests {
             .unwrap();
 
         assert_eq!(scroll_handle.max_offset().y, px(0.));
+    }
+
+    struct VerticalScroller {
+        scroll_handle: ScrollHandle,
+    }
+
+    impl Render for VerticalScroller {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .id("vertical")
+                    .w(px(100.))
+                    .h(px(100.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .child(div().w_full().h(px(300.))),
+            )
+        }
+    }
+
+    fn draw_vertical_scroller(cx: &mut TestAppContext) -> (AnyWindowHandle, ScrollHandle) {
+        let scroll_handle = ScrollHandle::new();
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let scroll_handle = scroll_handle.clone();
+                move |_, _| VerticalScroller { scroll_handle }
+            })
+            .into();
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        (window, scroll_handle)
+    }
+
+    fn touch_pan(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        from: Point<Pixels>,
+        to: Point<Pixels>,
+    ) {
+        let touch = |phase, position| {
+            TouchEvent {
+                id: TouchId(1),
+                phase,
+                position,
+                predicted_position: None,
+                force: None,
+            }
+            .to_platform_input()
+        };
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(touch(TouchPhase::Started, from), cx);
+            window.dispatch_event(touch(TouchPhase::Moved, to), cx);
+            window.dispatch_event(touch(TouchPhase::Ended, to), cx);
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn horizontal_touch_pan_does_not_scroll_a_vertical_container(cx: &mut TestAppContext) {
+        let (window, scroll_handle) = draw_vertical_scroller(cx);
+
+        touch_pan(cx, window, point(px(80.), px(50.)), point(px(20.), px(50.)));
+        assert_eq!(scroll_handle.offset(), Point::default());
+
+        // A vertical pan over the same container still scrolls it. (A fresh
+        // window: a touch landing during the first pan's fling would catch it.)
+        let (window, scroll_handle) = draw_vertical_scroller(cx);
+        touch_pan(cx, window, point(px(50.), px(80.)), point(px(50.), px(20.)));
+        assert!(scroll_handle.offset().y < px(0.));
+        assert_eq!(scroll_handle.offset().x, px(0.));
+    }
+
+    #[gpui::test]
+    fn horizontal_wheel_still_scrolls_a_vertical_container(cx: &mut TestAppContext) {
+        let (window, scroll_handle) = draw_vertical_scroller(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position: point(px(50.), px(50.)),
+                    delta: crate::ScrollDelta::Pixels(point(px(-40.), px(0.))),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        assert_eq!(scroll_handle.offset(), point(px(0.), px(-40.)));
     }
 
     struct ContentSizedGrid;
