@@ -12,17 +12,18 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
     Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    MonochromeSprite, MouseButton, MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Path,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
     TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    TouchDragEvent, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size,
+    transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -1283,6 +1284,12 @@ pub struct Window {
     touch_prediction_enabled: bool,
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
+    /// The axes along which the scroll containers enclosing the element being
+    /// painted can scroll.
+    pub(crate) scrollable_axes: Point<bool>,
+    /// Set by a mouse-draggable element under a starting touch drag, to the
+    /// scrollable axes it was painted with.
+    pub(crate) mouse_drag_scroll_axes: Option<Point<bool>>,
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
@@ -2184,6 +2191,8 @@ impl Window {
             touch_prediction_enabled: true,
             long_press_timer: None,
             long_press_capture: None,
+            scrollable_axes: Point::default(),
+            mouse_drag_scroll_axes: None,
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
@@ -5865,10 +5874,16 @@ impl Window {
                 cx.propagate_event = true;
                 self.default_prevented = false;
                 let started = touch_drag.phase == crate::TouchPhase::Started;
+                self.mouse_drag_scroll_axes = None;
                 self.dispatch_mouse_event(&touch_drag, cx);
                 if started {
                     self.touch_gestures
                         .resolve_touch_drag(self.default_prevented);
+                    if let Some(scroll_axes) = self.mouse_drag_scroll_axes.take()
+                        && !self.default_prevented
+                    {
+                        self.touch_gestures.allow_mouse_drag(scroll_axes);
+                    }
                 }
             }
             RecognizedTouchGesture::LongPress(long_press) => {
@@ -5887,14 +5902,71 @@ impl Window {
                 self.dispatch_mouse_event(&long_press, cx);
                 if started {
                     let claimed = self.default_prevented;
-                    self.touch_gestures.resolve_long_press(claimed);
+                    let mouse_drag = self.touch_gestures.resolve_long_press(claimed);
                     if !claimed {
                         self.long_press_capture = None;
+                    }
+                    if let Some(mouse_drag) = mouse_drag {
+                        self.dispatch_recognized_touch_gesture(mouse_drag, cx);
                     }
                 }
                 if ended {
                     self.long_press_capture = None;
                 }
+            }
+            RecognizedTouchGesture::MouseDrag(touch_drag) => {
+                self.dispatch_touch_drag_as_mouse(touch_drag, cx);
+            }
+        }
+    }
+
+    /// Carries a touch drag through the mouse drag path, so that `on_drag`,
+    /// `on_drag_move`, and `on_drop` work the same for touch as for a mouse.
+    fn dispatch_touch_drag_as_mouse(&mut self, touch_drag: TouchDragEvent, cx: &mut App) {
+        let dispatch = |window: &mut Self, position, event: &dyn Any, cx: &mut App| {
+            window.mouse_position = position;
+            cx.propagate_event = true;
+            window.dispatch_mouse_event(event, cx);
+        };
+        let button = MouseButton::Left;
+        let modifiers = Modifiers::default();
+        let position = touch_drag.position;
+        let mouse_move = MouseMoveEvent {
+            position,
+            pressed_button: Some(button),
+            modifiers,
+        };
+        let mouse_up = |position| MouseUpEvent {
+            button,
+            position,
+            modifiers,
+            click_count: 1,
+        };
+        match touch_drag.phase {
+            crate::TouchPhase::Started => {
+                let start_position = touch_drag.start_position;
+                let mouse_down = MouseDownEvent {
+                    button,
+                    position: start_position,
+                    modifiers,
+                    click_count: 1,
+                    first_mouse: false,
+                };
+                dispatch(self, start_position, &mouse_down, cx);
+                if position != start_position {
+                    dispatch(self, position, &mouse_move, cx);
+                }
+            }
+            crate::TouchPhase::Moved => dispatch(self, position, &mouse_move, cx),
+            crate::TouchPhase::Ended => dispatch(self, position, &mouse_up(position), cx),
+            crate::TouchPhase::Cancelled => {
+                // Release outside the window with the drag already gone, so
+                // that the press neither drops nor clicks.
+                cx.active_drag = None;
+                let outside = point(px(-1.), px(-1.));
+                dispatch(self, outside, &mouse_up(outside), cx);
+                self.mouse_position = position;
+                self.refresh();
             }
         }
     }
@@ -7881,12 +7953,12 @@ mod tests {
     use crate::{
         AnyWindowHandle, AppContext as _, Bounds, ContentMask, Context, DispatchPhase,
         DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent,
-        FocusHandle, InputEvent as _, InteractiveElement as _, IntoElement, KeyDownEvent,
-        Keystroke, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-        Pixels, PlatformInput, Point, Render, RequestFrameOptions, ScaledPixels,
-        StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
-        TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions,
-        canvas, div, hsla, point, px, size,
+        FocusHandle, GestureTuning, InputEvent as _, InteractiveElement as _, IntoElement,
+        KeyDownEvent, Keystroke, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+        MouseUpEvent, ParentElement, Pixels, PlatformInput, Point, Render, RequestFrameOptions,
+        ScaledPixels, ScrollHandle, StatefulInteractiveElement as _, Styled, TestAppContext,
+        TouchDragEvent, TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle, Window,
+        WindowAppearance, WindowOptions, canvas, div, hsla, point, px, size,
     };
 
     #[cfg(feature = "profiler")]
@@ -9076,6 +9148,286 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
+    }
+
+    #[derive(Clone)]
+    struct DraggedRow(usize);
+
+    impl Render for DraggedRow {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            Empty
+        }
+    }
+
+    #[derive(Default)]
+    struct DragLog {
+        moves: Vec<Point<Pixels>>,
+        drops: Vec<usize>,
+        clicks: usize,
+    }
+
+    /// A free draggable at x 0..50 and a drop target at x 100..150, both at y 0..50; below
+    /// them, at y 100..200, a scrolling list of draggable rows at x 0..50 and a scrolling
+    /// plain column at x 100..150.
+    struct TouchDragView {
+        log: Rc<RefCell<DragLog>>,
+        rows: ScrollHandle,
+        plain: ScrollHandle,
+    }
+
+    impl TouchDragView {
+        fn draggable(&self, id: usize) -> impl IntoElement {
+            let log = self.log.clone();
+            let click_log = self.log.clone();
+            div()
+                .id(id)
+                .flex_none()
+                .size(px(50.))
+                .on_drag(DraggedRow(id), |row, _, _, cx| cx.new(|_| row.clone()))
+                .on_drag_move::<DraggedRow>(move |event, _, _| {
+                    log.borrow_mut().moves.push(event.event.position)
+                })
+                .on_click(move |_, _, _| click_log.borrow_mut().clicks += 1)
+        }
+    }
+
+    impl Render for TouchDragView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let log = self.log.clone();
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap(px(50.))
+                .child(
+                    div().flex().gap(px(50.)).child(self.draggable(0)).child(
+                        div()
+                            .id("target")
+                            .size(px(50.))
+                            .on_drop(move |row: &DraggedRow, _, _| {
+                                log.borrow_mut().drops.push(row.0)
+                            }),
+                    ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(50.))
+                        .child(
+                            div()
+                                .id("rows")
+                                .w(px(50.))
+                                .h(px(100.))
+                                .overflow_y_scroll()
+                                .track_scroll(&self.rows)
+                                .children((1..=10).map(|id| self.draggable(id))),
+                        )
+                        .child(
+                            div()
+                                .id("plain")
+                                .w(px(50.))
+                                .h(px(100.))
+                                .overflow_y_scroll()
+                                .track_scroll(&self.plain)
+                                .child(div().w(px(50.)).h(px(500.))),
+                        ),
+                )
+        }
+    }
+
+    fn add_touch_drag_view(
+        cx: &mut TestAppContext,
+    ) -> (crate::WindowHandle<TouchDragView>, Rc<RefCell<DragLog>>) {
+        let log = Rc::new(RefCell::new(DragLog::default()));
+        let window = cx.add_window({
+            let log = log.clone();
+            move |_, _| TouchDragView {
+                log,
+                rows: ScrollHandle::new(),
+                plain: ScrollHandle::new(),
+            }
+        });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        (window, log)
+    }
+
+    fn touch_at(
+        window: crate::WindowHandle<TouchDragView>,
+        cx: &mut TestAppContext,
+        phase: TouchPhase,
+        x: f32,
+        y: f32,
+    ) {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                TouchEvent {
+                    id: TouchId(1),
+                    phase,
+                    position: point(px(x), px(y)),
+                    predicted_position: None,
+                    force: None,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    fn has_active_drag(
+        window: crate::WindowHandle<TouchDragView>,
+        cx: &mut TestAppContext,
+    ) -> bool {
+        window
+            .update(cx, |_, _, cx| cx.active_drag.is_some())
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn touch_drags_and_drops_an_on_drag_element(cx: &mut TestAppContext) {
+        let (window, log) = add_touch_drag_view(cx);
+
+        touch_at(window, cx, TouchPhase::Started, 10., 10.);
+        touch_at(window, cx, TouchPhase::Moved, 30., 10.);
+        assert!(has_active_drag(window, cx));
+        touch_at(window, cx, TouchPhase::Moved, 120., 10.);
+        touch_at(window, cx, TouchPhase::Ended, 120., 10.);
+
+        assert!(!has_active_drag(window, cx));
+        let log = log.borrow();
+        assert_eq!(log.moves.last(), Some(&point(px(120.), px(10.))));
+        assert_eq!(log.drops, [0]);
+        assert_eq!(log.clicks, 0);
+    }
+
+    #[gpui::test]
+    fn cancelled_touch_drag_ends_without_dropping(cx: &mut TestAppContext) {
+        let (window, log) = add_touch_drag_view(cx);
+
+        touch_at(window, cx, TouchPhase::Started, 10., 10.);
+        touch_at(window, cx, TouchPhase::Moved, 120., 10.);
+        assert!(has_active_drag(window, cx));
+        touch_at(window, cx, TouchPhase::Cancelled, 120., 10.);
+
+        assert!(!has_active_drag(window, cx));
+        assert!(log.borrow().drops.is_empty());
+        assert_eq!(log.borrow().clicks, 0);
+    }
+
+    #[gpui::test]
+    fn tapping_an_on_drag_element_still_clicks(cx: &mut TestAppContext) {
+        let (window, log) = add_touch_drag_view(cx);
+
+        touch_at(window, cx, TouchPhase::Started, 10., 10.);
+        touch_at(window, cx, TouchPhase::Ended, 12., 10.);
+
+        assert!(!has_active_drag(window, cx));
+        assert_eq!(log.borrow().clicks, 1);
+    }
+
+    #[gpui::test]
+    fn touch_drag_inside_scroll_container_scrolls_along_its_axis(cx: &mut TestAppContext) {
+        let (window, log) = add_touch_drag_view(cx);
+        let rows_offset =
+            |cx: &mut TestAppContext| window.update(cx, |view, _, _| view.rows.offset()).unwrap();
+
+        // Along the list's axis, a draggable row scrolls the list.
+        touch_at(window, cx, TouchPhase::Started, 10., 160.);
+        touch_at(window, cx, TouchPhase::Moved, 10., 130.);
+        assert!(!has_active_drag(window, cx));
+        assert_eq!(rows_offset(cx).y, px(-30.));
+        // Cancel rather than lift, so that no fling catches the next touch.
+        touch_at(window, cx, TouchPhase::Cancelled, 10., 130.);
+        let scrolled = rows_offset(cx);
+
+        // Across it, the row drags.
+        touch_at(window, cx, TouchPhase::Started, 10., 160.);
+        touch_at(window, cx, TouchPhase::Moved, 40., 160.);
+        assert!(has_active_drag(window, cx));
+        touch_at(window, cx, TouchPhase::Ended, 40., 160.);
+        assert!(!has_active_drag(window, cx));
+        assert_eq!(rows_offset(cx), scrolled);
+
+        // After a long press, it drags along the list's axis too.
+        touch_at(window, cx, TouchPhase::Started, 10., 160.);
+        cx.executor()
+            .advance_clock(GestureTuning::default().long_press_duration + Duration::from_millis(1));
+        cx.executor().run_until_parked();
+        touch_at(window, cx, TouchPhase::Moved, 10., 150.);
+        assert!(has_active_drag(window, cx));
+        touch_at(window, cx, TouchPhase::Moved, 10., 120.);
+        assert_eq!(log.borrow().moves.last(), Some(&point(px(10.), px(120.))));
+        touch_at(window, cx, TouchPhase::Ended, 10., 120.);
+        assert!(!has_active_drag(window, cx));
+        assert_eq!(rows_offset(cx), scrolled);
+        assert!(log.borrow().drops.is_empty());
+    }
+
+    #[gpui::test]
+    fn touch_drag_on_plain_content_scrolls(cx: &mut TestAppContext) {
+        let (window, log) = add_touch_drag_view(cx);
+
+        touch_at(window, cx, TouchPhase::Started, 110., 160.);
+        touch_at(window, cx, TouchPhase::Moved, 110., 120.);
+        touch_at(window, cx, TouchPhase::Ended, 110., 120.);
+
+        assert!(!has_active_drag(window, cx));
+        assert!(log.borrow().moves.is_empty());
+        let offset = window.update(cx, |view, _, _| view.plain.offset()).unwrap();
+        assert!(
+            offset.y <= px(-40.),
+            "plain content did not scroll: {offset:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn mouse_drags_and_drops_an_on_drag_element(cx: &mut TestAppContext) {
+        let (window, log) = add_touch_drag_view(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: point(px(10.), px(10.)),
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            for x in [20., 120.] {
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: point(px(x), px(10.)),
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            }
+            assert!(cx.active_drag.is_some());
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: point(px(120.), px(10.)),
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+
+        let log = log.borrow();
+        assert_eq!(log.moves.last(), Some(&point(px(120.), px(10.))));
+        assert_eq!(log.drops, [0]);
+        assert_eq!(log.clicks, 0);
     }
 
     #[gpui::test]

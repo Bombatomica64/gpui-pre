@@ -1613,11 +1613,14 @@ impl Element for List {
             }
         });
 
+        let scrollable_axes = window.scrollable_axes;
+        window.scrollable_axes.y |= self.state.0.borrow().items.summary().height > height;
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
                 item.element.paint(window, cx);
             }
         });
+        window.scrollable_axes = scrollable_axes;
     }
 }
 
