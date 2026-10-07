@@ -2016,6 +2016,7 @@ impl Element for Div {
             scroll_handle.scroll_to_active_item();
         }
 
+        let autoscroll_offset = self.interactivity.scroll_offset.clone();
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -2028,6 +2029,15 @@ impl Element for Div {
                 if style.display == Display::None {
                     return hitbox;
                 }
+
+                let autoscroll_offset = autoscroll_offset.filter(|_| {
+                    style.overflow.x == Overflow::Scroll || style.overflow.y == Overflow::Scroll
+                });
+                // A request made before our children prepaint isn't ours to
+                // serve; hold it for the scroll containers around this one.
+                let outer_autoscroll = autoscroll_offset
+                    .as_ref()
+                    .and_then(|_| window.take_autoscroll());
 
                 window.with_image_cache(image_cache, |window| {
                     window.with_element_offset(scroll_offset, |window| {
@@ -2049,6 +2059,22 @@ impl Element for Div {
                         listener(children_bounds, window, cx);
                     }
                 });
+
+                if let Some(autoscroll_offset) = autoscroll_offset {
+                    if let Some(request) = window.take_autoscroll() {
+                        let scroll_max = scroll_max(content_size, bounds, style, window);
+                        reveal_autoscroll_request(
+                            request,
+                            bounds,
+                            style.overflow,
+                            scroll_max,
+                            &autoscroll_offset,
+                            window,
+                        );
+                    } else if let Some(request) = outer_autoscroll {
+                        window.request_autoscroll(request);
+                    }
+                }
 
                 hitbox
             },
@@ -2438,11 +2464,6 @@ impl Interactivity {
         window: &mut Window,
         _cx: &mut App,
     ) -> Point<Pixels> {
-        fn round_to_two_decimals(pixels: Pixels) -> Pixels {
-            const ROUNDING_FACTOR: f32 = 100.0;
-            (pixels * ROUNDING_FACTOR).round() / ROUNDING_FACTOR
-        }
-
         if let Some(scroll_offset) = self.scroll_offset.as_ref() {
             let mut scroll_to_bottom = false;
             let mut tracked_scroll_handle = self
@@ -2454,26 +2475,7 @@ impl Interactivity {
                 scroll_to_bottom = mem::take(&mut scroll_handle_state.scroll_to_bottom);
             }
 
-            let rem_size = window.rem_size();
-            // Taffy lays the box out with the padding snapped to the device pixel
-            // grid (`to_taffy`); recomputed unsnapped, e.g. py_1 at a fractional
-            // rem size, it exceeds `bounds` and leaves the box scrollable by the
-            // sub-pixel difference.
-            let padding = style
-                .padding
-                .to_pixels(bounds.size.into(), rem_size)
-                .map(|edge| window.pixel_snap(*edge));
-            let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
-            // The floating point values produced by Taffy and ours often vary
-            // slightly after ~5 decimal places. This can lead to cases where after
-            // subtracting these, the container becomes scrollable for less than
-            // 0.00000x pixels. As we generally don't benefit from a precision that
-            // high for the maximum scroll, we round the scroll max to 2 decimal
-            // places here.
-            let padded_content_size = self.content_size + padding_size;
-            let scroll_max = Point::from(padded_content_size - bounds.size)
-                .map(round_to_two_decimals)
-                .max(&Default::default());
+            let scroll_max = scroll_max(self.content_size, bounds, style, window);
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
@@ -3702,6 +3704,104 @@ pub(crate) enum ActiveTooltip {
         tooltip: AnyTooltip,
         _task: Task<()>,
     },
+}
+
+/// The largest distance a scroll container with these bounds can scroll its content.
+fn scroll_max(
+    content_size: Size<Pixels>,
+    bounds: Bounds<Pixels>,
+    style: &Style,
+    window: &Window,
+) -> Point<Pixels> {
+    fn round_to_two_decimals(pixels: Pixels) -> Pixels {
+        const ROUNDING_FACTOR: f32 = 100.0;
+        (pixels * ROUNDING_FACTOR).round() / ROUNDING_FACTOR
+    }
+
+    // Taffy lays the box out with the padding snapped to the device pixel
+    // grid (`to_taffy`); recomputed unsnapped, e.g. py_1 at a fractional
+    // rem size, it exceeds `bounds` and leaves the box scrollable by the
+    // sub-pixel difference.
+    let padding = style
+        .padding
+        .to_pixels(bounds.size.into(), window.rem_size())
+        .map(|edge| window.pixel_snap(*edge));
+    let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
+    // The floating point values produced by Taffy and ours often vary
+    // slightly after ~5 decimal places. This can lead to cases where after
+    // subtracting these, the container becomes scrollable for less than
+    // 0.00000x pixels. As we generally don't benefit from a precision that
+    // high for the maximum scroll, we round the scroll max to 2 decimal
+    // places here.
+    let padded_content_size = content_size + padding_size;
+    Point::from(padded_content_size - bounds.size)
+        .map(round_to_two_decimals)
+        .max(&Default::default())
+}
+
+/// Scrolls a container just far enough to bring a descendant's
+/// [`Window::request_autoscroll`] bounds into view, along the axes it scrolls.
+///
+/// The children were already prepainted at the old offset and can't be
+/// prepainted twice, so the new offset applies from the next frame, which this
+/// schedules. Whatever this container can't reveal (it is clamped, or itself
+/// clipped by an ancestor) is requested again, shifted to where it will be
+/// next frame, for the scroll containers around this one.
+fn reveal_autoscroll_request(
+    request: Bounds<Pixels>,
+    bounds: Bounds<Pixels>,
+    overflow: Point<Overflow>,
+    scroll_max: Point<Pixels>,
+    scroll_offset: &RefCell<Point<Pixels>>,
+    window: &mut Window,
+) {
+    // How far content has to move along one axis for `start..end` to fit
+    // `visible_start..visible_end`, preferring the start edge when it can't.
+    fn reveal_delta(
+        start: Pixels,
+        end: Pixels,
+        visible_start: Pixels,
+        visible_end: Pixels,
+    ) -> Pixels {
+        if start < visible_start {
+            visible_start - start
+        } else if end > visible_end {
+            (visible_end - end).max(visible_start - start)
+        } else {
+            Pixels::ZERO
+        }
+    }
+
+    let mut scroll_offset = scroll_offset.borrow_mut();
+    let old_offset = *scroll_offset;
+    if overflow.x == Overflow::Scroll {
+        let delta = reveal_delta(
+            request.left(),
+            request.right(),
+            bounds.left(),
+            bounds.right(),
+        );
+        scroll_offset.x = (scroll_offset.x + delta).clamp(-scroll_max.x, Pixels::ZERO);
+    }
+    if overflow.y == Overflow::Scroll {
+        let delta = reveal_delta(
+            request.top(),
+            request.bottom(),
+            bounds.top(),
+            bounds.bottom(),
+        );
+        scroll_offset.y = (scroll_offset.y + delta).clamp(-scroll_max.y, Pixels::ZERO);
+    }
+
+    let moved = *scroll_offset - old_offset;
+    let request = Bounds::new(request.origin + moved, request.size);
+    if moved != Point::default() {
+        window.request_animation_frame();
+    }
+    let visible = window.content_mask().bounds;
+    if visible.intersect(&request) != request {
+        window.request_autoscroll(request);
+    }
 }
 
 pub(crate) fn clear_active_tooltip(
@@ -5633,6 +5733,158 @@ mod tests {
             .unwrap();
 
         assert_eq!(scroll_handle.max_offset().y, px(0.));
+    }
+
+    /// A 20px tall target that requests autoscroll once when `request` is set,
+    /// and records the bounds it was last prepainted at.
+    fn autoscroll_target(
+        request: &Rc<Cell<bool>>,
+        target_bounds: &Rc<Cell<Bounds<Pixels>>>,
+    ) -> impl IntoElement {
+        let request = request.clone();
+        let target_bounds = target_bounds.clone();
+        canvas(
+            move |bounds, window, _| {
+                target_bounds.set(bounds);
+                if request.take() {
+                    window.request_autoscroll(bounds);
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .w_full()
+        .h(px(20.))
+    }
+
+    struct AutoscrollView {
+        outer: ScrollHandle,
+        inner: Option<ScrollHandle>,
+        request: Rc<Cell<bool>>,
+        target_bounds: Rc<Cell<Bounds<Pixels>>>,
+    }
+
+    impl Render for AutoscrollView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let target = autoscroll_target(&self.request, &self.target_bounds);
+            // outer: 100px tall, scrolls; with `inner`, an 80px scroller sits
+            // 150px down it and holds the target 200px down, otherwise the
+            // target sits 300px down the outer scroller.
+            let content = match &self.inner {
+                Some(inner) => div()
+                    .child(div().h(px(150.)))
+                    .child(
+                        div()
+                            .id("inner")
+                            .h(px(80.))
+                            .overflow_y_scroll()
+                            .track_scroll(inner)
+                            .child(div().h(px(200.)))
+                            .child(target),
+                    )
+                    .into_any_element(),
+                None => div()
+                    .child(div().h(px(300.)))
+                    .child(target)
+                    .into_any_element(),
+            };
+            div().size_full().child(
+                div()
+                    .id("outer")
+                    .w(px(100.))
+                    .h(px(100.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.outer)
+                    .child(content),
+            )
+        }
+    }
+
+    fn draw_autoscroll_view(
+        cx: &mut TestAppContext,
+        inner: Option<ScrollHandle>,
+    ) -> (
+        AnyWindowHandle,
+        ScrollHandle,
+        Rc<Cell<bool>>,
+        Rc<Cell<Bounds<Pixels>>>,
+    ) {
+        let outer = ScrollHandle::new();
+        let request = Rc::new(Cell::new(false));
+        let target_bounds = Rc::new(Cell::new(Bounds::default()));
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let outer = outer.clone();
+                let request = request.clone();
+                let target_bounds = target_bounds.clone();
+                move |_, _| AutoscrollView {
+                    outer,
+                    inner,
+                    request,
+                    target_bounds,
+                }
+            })
+            .into();
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        (window, outer, request, target_bounds)
+    }
+
+    fn redraw(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        cx.update_window(window, |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx)
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn scroll_container_reveals_a_descendants_autoscroll_request(cx: &mut TestAppContext) {
+        let (window, outer, request, target_bounds) = draw_autoscroll_view(cx, None);
+        assert_eq!(outer.offset().y, px(0.));
+        assert_eq!(target_bounds.get().top(), px(300.));
+
+        request.set(true);
+        redraw(cx, window);
+        // Just far enough for the target's bottom to meet the container's.
+        assert_eq!(outer.offset().y, px(-220.));
+
+        redraw(cx, window);
+        assert_eq!(target_bounds.get().top(), px(80.));
+        assert_eq!(target_bounds.get().bottom(), px(100.));
+        assert_eq!(outer.offset().y, px(-220.));
+    }
+
+    #[gpui::test]
+    fn nested_scroll_containers_each_reveal_their_share(cx: &mut TestAppContext) {
+        let inner = ScrollHandle::new();
+        let (window, outer, request, target_bounds) = draw_autoscroll_view(cx, Some(inner.clone()));
+        assert_eq!(target_bounds.get().top(), px(350.));
+
+        request.set(true);
+        redraw(cx, window);
+        // The inner scroller brings the target to its own bottom edge, but it
+        // is itself clipped by the outer one, which scrolls the rest.
+        assert_eq!(inner.offset().y, px(-140.));
+        assert_eq!(outer.offset().y, px(-130.));
+
+        redraw(cx, window);
+        assert_eq!(target_bounds.get().top(), px(80.));
+        assert_eq!(target_bounds.get().bottom(), px(100.));
+    }
+
+    #[gpui::test]
+    fn scroll_offset_is_untouched_without_an_autoscroll_request(cx: &mut TestAppContext) {
+        let inner = ScrollHandle::new();
+        let (window, outer, _request, target_bounds) =
+            draw_autoscroll_view(cx, Some(inner.clone()));
+        outer.set_offset(point(px(0.), px(-50.)));
+        inner.set_offset(point(px(0.), px(-10.)));
+
+        redraw(cx, window);
+        redraw(cx, window);
+        assert_eq!(outer.offset().y, px(-50.));
+        assert_eq!(inner.offset().y, px(-10.));
+        assert_eq!(target_bounds.get().top(), px(290.));
     }
 
     struct ContentSizedGrid;
