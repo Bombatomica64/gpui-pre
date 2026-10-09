@@ -62,6 +62,20 @@ default = [
     "x11",
     "windows-manifest",
 ]
+# Decoders beyond gif, jpeg, png and webp (about 1.4 MB on arm64 Android).
+extra-image-formats = [
+    "image/bmp",
+    "image/dds",
+    "image/exr",
+    "image/ff",
+    "image/hdr",
+    "image/ico",
+    "image/pnm",
+    "image/qoi",
+    "image/rayon",
+    "image/tga",
+    "image/tiff",
+]
 inspector = ["gpui_macros/inspector"]
 leak-detection = []
 profiler = ["dep:hdrhistogram"]
@@ -350,20 +364,9 @@ package = "gpui-pre-http-client"
 [dependencies.image]
 version = "0.25.1"
 features = [
-    "bmp",
-    "dds",
-    "exr",
-    "ff",
     "gif",
-    "hdr",
-    "ico",
     "jpeg",
     "png",
-    "pnm",
-    "qoi",
-    "rayon",
-    "tga",
-    "tiff",
     "webp",
 ]
 default-features = false
