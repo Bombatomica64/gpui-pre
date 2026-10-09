@@ -2440,6 +2440,40 @@ pub struct TextInputConfiguration {
     pub suggestions: bool,
     /// The action advertised on a software keyboard's confirm ("enter") key.
     pub input_action: TextInputAction,
+    /// What the field holds, which picks the software keyboard layout and tells
+    /// the platform whether the text is secret.
+    pub purpose: TextInputPurpose,
+}
+
+/// What a text field holds.
+///
+/// The non-secret variants follow the HTML `inputmode` attribute's value set
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#input-modalities:-the-inputmode-attribute>),
+/// which maps onto Android's `InputType` classes and iOS's `UIKeyboardType`.
+/// The password variants also tell the platform to keep the text out of
+/// keyboard suggestions and learning (`TYPE_TEXT_VARIATION_PASSWORD`,
+/// `secureTextEntry`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextInputPurpose {
+    /// Free text.
+    #[default]
+    Text,
+    /// A search query.
+    Search,
+    /// An email address.
+    Email,
+    /// A URL.
+    Url,
+    /// A telephone number.
+    Phone,
+    /// A whole number.
+    Numeric,
+    /// A number with a fractional part.
+    Decimal,
+    /// A password.
+    Password,
+    /// A password made of digits, such as a PIN.
+    NumericPassword,
 }
 
 /// Automatic capitalization applied by software keyboards.
