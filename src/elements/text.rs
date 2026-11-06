@@ -281,9 +281,10 @@ impl Element for &'static str {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
+        report_static_text(self, bounds, window);
         text_layout.prepaint(bounds, self)
     }
 
@@ -298,6 +299,42 @@ impl Element for &'static str {
         cx: &mut App,
     ) {
         text_layout.paint(self, window, cx)
+    }
+}
+
+/// Text without an element id still belongs in the accessibility tree: report
+/// it as a label under the nearest accessible ancestor, unless that ancestor
+/// already speaks for it. See `A11yNodeBuilder::push_static_text`.
+fn report_static_text(text: &str, bounds: Bounds<Pixels>, window: &mut Window) {
+    if !window.a11y.is_active() {
+        return;
+    }
+    let scale = window.scale_factor();
+    let rect = accesskit::Rect {
+        x0: (bounds.origin.x.0 * scale) as f64,
+        y0: (bounds.origin.y.0 * scale) as f64,
+        x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
+        y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
+    };
+    if let Some(node_id) = window.a11y.nodes.push_static_text(text, rect) {
+        window.a11y.node_bounds.insert(node_id, bounds);
+        #[cfg(debug_assertions)]
+        {
+            let view = window
+                .a11y
+                .view_type_names
+                .get(&window.current_view())
+                .copied();
+            window.a11y.nodes.record_node_info(
+                node_id,
+                crate::window::a11y::debug::NodeDebugInfo {
+                    synthetic: true,
+                    view,
+                    element_id: None,
+                    source_location: None,
+                },
+            );
+        }
     }
 }
 
@@ -355,9 +392,10 @@ impl Element for SharedString {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
+        report_static_text(self.as_ref(), bounds, window);
         text_layout.prepaint(bounds, self.as_ref())
     }
 
@@ -581,9 +619,10 @@ impl Element for StyledText {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
+        report_static_text(&self.text, bounds, window);
         self.layout.prepaint(bounds, &self.text)
     }
 
