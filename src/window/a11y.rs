@@ -185,12 +185,29 @@ impl A11y {
         }
     }
 
-    /// Logs (once per focus change) that the focused element is not exposed to
-    /// assistive technology because it has no accessibility node. When this
-    /// happens, screen readers fall back to announcing the whole window instead
-    /// of the focused element. The fix is to give the element both an
-    /// `.id(...)` and a `.role(...)`.
-    pub(crate) fn note_focus_without_node(&mut self, focus_id: FocusId, reason: &str) {
+    /// Reports focus for a focused element that has no accessibility node of
+    /// its own.
+    ///
+    /// Composite widgets often keep keyboard focus on an inner element without
+    /// a role (a text field's editor, say) while the role, label and value sit
+    /// on an outer frame that tracks its own focus handle. Such a frame
+    /// contains the focus, so it is reported as focused: the nearest ancestor
+    /// that has a node and was registered as focusable this frame.
+    ///
+    /// Without such an ancestor, logs (once per focus change) that the focused
+    /// element is not exposed to assistive technology. Screen readers then fall
+    /// back to announcing the whole window instead of the focused element. The
+    /// fix is to give the element both an `.id(...)` and a `.role(...)`.
+    pub(crate) fn focus_without_node(&mut self, focus_id: FocusId, reason: &str) {
+        let focus_ids = &self.focus_ids;
+        let ancestor = self
+            .nodes
+            .nearest_ancestor(|id| focus_ids.contains_key(&id));
+        if let Some(ancestor) = ancestor {
+            self.last_focus_without_node = None;
+            self.nodes.set_focus(ancestor);
+            return;
+        }
         if self.last_focus_without_node != Some(focus_id) {
             self.last_focus_without_node = Some(focus_id);
             log::info!(
@@ -250,7 +267,7 @@ impl A11y {
             // The element registered a focus handle and an id, but never got a
             // node because it has no role.
             if let Some(focus_id) = self.focus_ids.get(&node_id).copied() {
-                self.note_focus_without_node(focus_id, "it has an id but no role");
+                self.focus_without_node(focus_id, "it has an id but no role");
             }
         }
     }
@@ -566,6 +583,18 @@ impl A11yNodeBuilder {
     /// Returns whether a node with the given ID has been pushed in this frame.
     pub(crate) fn has_node(&self, id: NodeId) -> bool {
         id == ROOT_NODE_ID || self.seen_ids.contains(&id)
+    }
+
+    /// The innermost node on the stack (the current element's nearest
+    /// accessible ancestor, or the current node itself) that matches
+    /// `predicate`, excluding the root.
+    pub(crate) fn nearest_ancestor(&self, predicate: impl Fn(NodeId) -> bool) -> Option<NodeId> {
+        self.ids_stack
+            .iter()
+            .rev()
+            .copied()
+            .take_while(|id| *id != ROOT_NODE_ID)
+            .find(|id| predicate(*id))
     }
 
     /// Returns whether `id` is the node currently reported as focused.
@@ -1065,5 +1094,42 @@ mod tests {
 
         let update = a11y.end_frame(Default::default());
         assert_eq!(update.focus, a);
+    }
+
+    // A focused element without a node of its own (a text field's editor,
+    // with no role) reports focus on its nearest focusable accessible
+    // ancestor (the field's frame), skipping ancestors that aren't focusable.
+    #[test]
+    fn focus_without_node_falls_back_to_focusable_ancestor() {
+        let mut a11y = new_a11y();
+        let frame = NodeId(1);
+        let wrapper = NodeId(2);
+        let editor = NodeId(3);
+
+        assert!(a11y.nodes.push(frame, test_node()));
+        a11y.set_focusable(frame, FocusId::default());
+        assert!(a11y.nodes.push(wrapper, test_node()));
+        // The editor has an id and a focus handle but no role, so no node.
+        a11y.set_focusable(editor, FocusId::default());
+        a11y.set_focus(editor);
+        a11y.nodes.pop(); // wrapper
+        a11y.nodes.pop(); // frame
+
+        let update = a11y.end_frame(Default::default());
+        assert_eq!(update.focus, frame);
+    }
+
+    // Without a focusable ancestor, focus stays on the window.
+    #[test]
+    fn focus_without_node_or_focusable_ancestor_stays_on_window() {
+        let mut a11y = new_a11y();
+        let container = NodeId(1);
+
+        assert!(a11y.nodes.push(container, test_node()));
+        a11y.focus_without_node(FocusId::default(), "test");
+        a11y.nodes.pop(); // container
+
+        let update = a11y.end_frame(Default::default());
+        assert_eq!(update.focus, ROOT_NODE_ID);
     }
 }

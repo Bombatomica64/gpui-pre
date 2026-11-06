@@ -2361,11 +2361,11 @@ impl Interactivity {
                     }
                 } else if focus_handle.is_focused(window) {
                     // Focusable, but with no element id it can't have an
-                    // accessibility node, so screen readers fall back to the
-                    // whole window.
+                    // accessibility node: focus goes to the nearest focusable
+                    // accessible ancestor, or else the whole window.
                     window
                         .a11y
-                        .note_focus_without_node(focus_handle.id, "it has no element id");
+                        .focus_without_node(focus_handle.id, "it has no element id");
                 }
             }
         }
