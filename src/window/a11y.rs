@@ -371,6 +371,9 @@ impl<'a> A11ySubtreeBuilder<'a> {
 pub(crate) struct A11yNodeBuilder {
     ids_stack: SmallVec<[NodeId; 16]>,
     nodes_stack: SmallVec<[accesskit::Node; 16]>,
+    /// For each node on the stack, how many static text nodes (see
+    /// [`Self::push_static_text`]) it has received this frame.
+    static_text_counts: SmallVec<[u32; 16]>,
     /// This is the exact type required by accesskit, so we can't just make it a
     /// `HashMap<NodeId, Node>` to remove the need for `seen_ids`
     all_nodes: Vec<(NodeId, accesskit::Node)>,
@@ -392,6 +395,7 @@ impl A11yNodeBuilder {
         Self {
             ids_stack: SmallVec::new(),
             nodes_stack: SmallVec::new(),
+            static_text_counts: SmallVec::new(),
             all_nodes: Vec::new(),
             seen_ids: FxHashSet::default(),
             focus: None,
@@ -436,6 +440,7 @@ impl A11yNodeBuilder {
         }
         self.ids_stack.push(id);
         self.nodes_stack.push(node);
+        self.static_text_counts.push(0);
         true
     }
 
@@ -465,8 +470,75 @@ impl A11yNodeBuilder {
     pub(crate) fn pop(&mut self) {
         debug_assert!(self.ids_stack.len() > 1, "pop would remove the root node");
 
+        self.static_text_counts.pop();
         if let (Some(id), Some(node)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
             self.all_nodes.push((id, node));
+        }
+    }
+
+    /// Report a run of text that has no element id (a plain string child,
+    /// [`SharedString`] or [`crate::StyledText`]) as a [`Role::Label`] leaf
+    /// under the nearest ancestor node, so screen readers can reach headings,
+    /// paragraphs and other static text.
+    ///
+    /// Nothing is added when that ancestor already speaks for its text: a
+    /// label, a text field, or a control with its own accessible name (a
+    /// button with `aria_label`, for example). Text inside such a node would
+    /// only repeat it.
+    ///
+    /// The node id is derived from the ancestor's id and the text's position
+    /// among the ancestor's static text, so it is stable across frames while
+    /// the ancestor's content keeps its shape.
+    ///
+    /// [`Role::Label`]: accesskit::Role::Label
+    pub(crate) fn push_static_text(
+        &mut self,
+        text: &str,
+        bounds: accesskit::Rect,
+    ) -> Option<NodeId> {
+        if text.trim().is_empty() {
+            return None;
+        }
+        let parent_id = *self.ids_stack.last()?;
+        let parent = self.nodes_stack.last()?;
+        if Self::speaks_for_its_text(parent) {
+            return None;
+        }
+        let count = self.static_text_counts.last_mut()?;
+        let index = *count;
+        *count += 1;
+
+        let mut hasher = std::hash::DefaultHasher::default();
+        parent_id.0.hash(&mut hasher);
+        "gpui-static-text".hash(&mut hasher);
+        index.hash(&mut hasher);
+        let id = NodeId(hasher.finish());
+
+        let mut node = accesskit::Node::new(accesskit::Role::Label);
+        node.set_bounds(bounds);
+        node.set_value(text.to_string());
+        self.push_leaf(id, node).then_some(id)
+    }
+
+    /// Whether `node` already conveys the text drawn inside it, so static text
+    /// children would be redundant. See [`Self::push_static_text`].
+    fn speaks_for_its_text(node: &accesskit::Node) -> bool {
+        use accesskit::Role::*;
+        match node.role() {
+            // Text and value carriers: their own value or label is the text.
+            Label | Paragraph | TextRun | Image | Meter | ProgressIndicator | Slider
+            | SpinButton | ComboBox | EditableComboBox | TextInput | MultilineTextInput
+            | SearchInput | PasswordInput | EmailInput | NumberInput | PhoneNumberInput
+            | UrlInput | DateInput | DateTimeInput | WeekInput | MonthInput | TimeInput => true,
+            // Containers keep their children's text even when they are named
+            // (a dialog's title doesn't replace its body).
+            Window | GenericContainer | Group | ScrollView | Pane | Dialog | AlertDialog
+            | Region | Section | Form | Document | Article | Main | Navigation | List | Tooltip
+            | Toolbar | TabPanel | Grid | Table | Tree => false,
+            // Anything else (buttons, links, menu items, list items, headings…)
+            // speaks for its text when it has a name of its own; unnamed, its
+            // text children give it one.
+            _ => node.label().is_some(),
         }
     }
 
@@ -475,6 +547,7 @@ impl A11yNodeBuilder {
         self.all_nodes.clear();
         self.ids_stack.clear();
         self.nodes_stack.clear();
+        self.static_text_counts.clear();
         self.seen_ids.clear();
         #[cfg(debug_assertions)]
         self.node_info.clear();
@@ -485,6 +558,7 @@ impl A11yNodeBuilder {
 
         self.ids_stack.push(ROOT_NODE_ID);
         self.nodes_stack.push(root_node);
+        self.static_text_counts.push(0);
         self.focus = None;
         self.active_descendant = None;
     }
@@ -656,6 +730,96 @@ mod tests {
         let mut a11y = A11y::new(Arc::new(AtomicBool::new(true)), false, None);
         a11y.begin_frame();
         a11y
+    }
+
+    fn rect() -> accesskit::Rect {
+        accesskit::Rect::new(0.0, 0.0, 10.0, 10.0)
+    }
+
+    fn labelled(role: Role, label: &str) -> accesskit::Node {
+        let mut node = accesskit::Node::new(role);
+        node.set_label(label);
+        node
+    }
+
+    fn finalized_node(builder: &mut A11yNodeBuilder, id: NodeId) -> accesskit::Node {
+        let update = builder.finalize();
+        update
+            .nodes
+            .into_iter()
+            .find(|(node_id, _)| *node_id == id)
+            .map(|(_, node)| node)
+            .expect("node in the update")
+    }
+
+    #[test]
+    fn static_text_is_reported_under_containers() {
+        let mut builder = new_builder();
+        let title = builder.push_static_text("Formatted input", rect()).unwrap();
+        // Named containers keep their text: a dialog's body is not its title.
+        assert!(builder.push(NodeId(1), labelled(Role::Dialog, "Edit server")));
+        let body = builder
+            .push_static_text("Changes apply at once.", rect())
+            .unwrap();
+        builder.pop();
+
+        let text = finalized_node(&mut builder, title);
+        assert_eq!(text.role(), Role::Label);
+        assert_eq!(text.value(), Some("Formatted input"));
+
+        let mut builder = new_builder();
+        builder.push_static_text("Formatted input", rect());
+        assert!(builder.push(NodeId(1), labelled(Role::Dialog, "Edit server")));
+        assert_eq!(
+            builder.push_static_text("Changes apply at once.", rect()),
+            Some(body)
+        );
+        builder.pop();
+        let dialog = finalized_node(&mut builder, NodeId(1));
+        assert_eq!(dialog.children(), &[body]);
+    }
+
+    #[test]
+    fn static_text_skipped_where_the_parent_speaks_for_it() {
+        let mut builder = new_builder();
+        assert!(builder.push(NodeId(1), labelled(Role::Button, "Copy")));
+        assert_eq!(builder.push_static_text("Copy", rect()), None);
+        builder.pop();
+        assert!(builder.push(NodeId(2), accesskit::Node::new(Role::TextInput)));
+        assert_eq!(builder.push_static_text("Type here…", rect()), None);
+        builder.pop();
+        assert!(builder.push(NodeId(3), accesskit::Node::new(Role::Label)));
+        assert_eq!(builder.push_static_text("hello", rect()), None);
+        builder.pop();
+        // An unnamed button gets its name from its text.
+        assert!(builder.push(NodeId(4), accesskit::Node::new(Role::Button)));
+        assert!(builder.push_static_text("Save", rect()).is_some());
+        builder.pop();
+        assert_eq!(builder.push_static_text("   ", rect()), None);
+    }
+
+    #[test]
+    fn static_text_ids_are_stable_and_distinct() {
+        let ids = |builder: &mut A11yNodeBuilder| {
+            let a = builder.push_static_text("a", rect()).unwrap();
+            assert!(builder.push(NodeId(1), test_node()));
+            let b = builder.push_static_text("b", rect()).unwrap();
+            let c = builder.push_static_text("c", rect()).unwrap();
+            builder.pop();
+            let d = builder.push_static_text("d", rect()).unwrap();
+            [a, b, c, d]
+        };
+        let first = ids(&mut new_builder());
+        // The same text in the next frame keeps its ids, even when its
+        // content changes.
+        let mut next = new_builder();
+        next.push_static_text("A", rect());
+        assert!(next.push(NodeId(1), test_node()));
+        let b = next.push_static_text("B", rect()).unwrap();
+        next.pop();
+        assert_eq!(b, first[1]);
+        let unique: std::collections::HashSet<_> = first.iter().collect();
+        assert_eq!(unique.len(), 4);
     }
 
     #[test]
