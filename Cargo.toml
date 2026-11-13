@@ -692,3 +692,9 @@ priority = -1
 [lints.rust.unexpected_cfgs]
 level = "allow"
 priority = 0
+
+# Fork-only. Zed's util_macros is a workspace crate and is not in this
+# crates.io snapshot. src/style.rs tests use #[perf]; ci/util_macros adds
+# #[test], which is what upstream does when the perf harness is off.
+[dev-dependencies.util_macros]
+path = "ci/util_macros"

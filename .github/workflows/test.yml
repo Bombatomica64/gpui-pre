@@ -1,0 +1,38 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [mobile-lab]
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lib:
+    name: gpui lib tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # This snapshot does not link Wayland, X11, Vulkan, or fontconfig
+      # (those live in gpui_platform). Lib tests use TestPlatform.
+      - name: Test fonts for svg_renderer
+        run: bash ci/place-test-fonts.sh
+
+      - name: Build the library
+        run: cargo check --locked --lib
+
+      - name: Integration test (action macros)
+        run: cargo test --locked --test action_macros
+
+      - name: Library tests
+        run: cargo test --locked --lib --features test-support

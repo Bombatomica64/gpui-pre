@@ -1,0 +1,13 @@
+[package]
+name = "util_macros"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Stand-in for Zed's util_macros so this crates.io snapshot can compile #[perf] tests."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote = "1"
+syn = { version = "2", features = ["full", "parsing"] }
