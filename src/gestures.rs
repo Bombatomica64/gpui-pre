@@ -14,10 +14,9 @@ use scheduler::Instant;
 use smallvec::SmallVec;
 
 use crate::{
-    Axis, GestureEvent, InputEvent, IsZero, Modifiers, MouseButton, MouseDownEvent, MouseEvent,
-    MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta, ScrollEvent, ScrollSource, TouchEvent,
-    TouchId, TouchPhase, point, px, seal::Sealed,
-Along,
+    Along, Axis, GestureEvent, InputEvent, IsZero, Modifiers, MouseButton, MouseDownEvent,
+    MouseEvent, MouseUpEvent, PinchEvent, Pixels, PlatformInput, Point, ScrollDelta, ScrollEvent,
+    ScrollSource, TouchEvent, TouchId, TouchPhase, point, px, seal::Sealed,
 };
 
 const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
@@ -525,8 +524,9 @@ const VELOCITY_MAX_SAMPLES: usize = 20;
 /// [`ClickEvent::Touch`](crate::ClickEvent), which keeps every existing
 /// mouse-driven behavior (click listeners, caret placement, double-tap
 /// selection) working before elements grow a direct tap-delivery path.
-/// Pinch recognition is not implemented yet, and additional touches are ignored
-/// while one is being recognized.
+/// A second touch that lands while the first is still pending or panning
+/// turns both into a pinch, surfaced as [`PinchEvent`]s; once either lifts,
+/// the other is ignored until it lifts too. Further touches are ignored.
 pub(crate) struct TouchGestureRecognizer {
     tuning: GestureTuning,
     state: TouchGestureState,
@@ -551,6 +551,9 @@ pub(crate) enum RecognizedTouchGesture {
     /// A touch drag of an element that only handles mouse drags, delivered
     /// as a synthesized mouse press, moves, and release.
     MouseDrag(TouchDragEvent),
+    /// One step of a two-finger pinch, delivered to pinch listeners at the
+    /// point between the fingers.
+    Pinch(PinchEvent),
 }
 
 enum TouchGestureState {
@@ -580,6 +583,46 @@ enum TouchGestureState {
     LongPressing(ActiveTouch),
     TouchDragging(ActiveTouch),
     MouseDragging(ActiveTouch),
+    /// Two touches pinching.
+    Pinching(Pinch),
+    /// What is left of a pinch after one of its touches lifted: this touch
+    /// does nothing until it lifts too.
+    Spent(TouchId),
+}
+
+struct Pinch {
+    touches: [(TouchId, Point<Pixels>); 2],
+    /// The distance between the touches at the last emitted step.
+    distance: f32,
+}
+
+impl Pinch {
+    fn center(&self) -> Point<Pixels> {
+        let [(_, a), (_, b)] = self.touches;
+        point((a.x + b.x) / 2., (a.y + b.y) / 2.)
+    }
+
+    fn distance(&self) -> f32 {
+        let [(_, a), (_, b)] = self.touches;
+        (a - b).magnitude() as f32
+    }
+
+    fn event(&self, phase: TouchPhase, delta: f32) -> RecognizedTouchGesture {
+        RecognizedTouchGesture::Pinch(PinchEvent {
+            position: self.center(),
+            delta,
+            modifiers: Modifiers::default(),
+            phase,
+        })
+    }
+
+    fn other(&self, id: TouchId) -> Option<TouchId> {
+        match self.touches {
+            [(a, _), (b, _)] if a == id => Some(b),
+            [(a, _), (b, _)] if b == id => Some(a),
+            _ => None,
+        }
+    }
 }
 
 struct ActiveTouch {
@@ -657,7 +700,10 @@ impl TouchGestureRecognizer {
                 } else {
                     false
                 };
-                if matches!(self.state, TouchGestureState::Idle) {
+                if let Some(pinch) = self.start_pinch(event, &mut recognized) {
+                    recognized.push(pinch.event(TouchPhase::Started, 0.));
+                    self.state = TouchGestureState::Pinching(pinch);
+                } else if matches!(self.state, TouchGestureState::Idle) {
                     let mut velocity_tracker = VelocityTracker::default();
                     velocity_tracker.push(now, event.position);
                     let touch = ActiveTouch {
@@ -817,6 +863,19 @@ impl TouchGestureRecognizer {
                     }));
                     self.state = TouchGestureState::MouseDragging(touch);
                 }
+                TouchGestureState::Pinching(mut pinch) => {
+                    if let Some(touch) = pinch.touches.iter_mut().find(|(id, _)| *id == event.id) {
+                        touch.1 = event.position;
+                        let distance = pinch.distance();
+                        if pinch.distance > 0. && distance != pinch.distance {
+                            recognized.push(
+                                pinch.event(TouchPhase::Moved, distance / pinch.distance - 1.),
+                            );
+                            pinch.distance = distance;
+                        }
+                    }
+                    self.state = TouchGestureState::Pinching(pinch);
+                }
                 other => self.state = other,
             },
             TouchPhase::Ended => match mem::replace(&mut self.state, TouchGestureState::Idle) {
@@ -946,6 +1005,11 @@ impl TouchGestureRecognizer {
                         position: event.position,
                     }));
                 }
+                TouchGestureState::Pinching(pinch) if pinch.other(event.id).is_some() => {
+                    recognized.push(pinch.event(TouchPhase::Ended, 0.));
+                    self.state = TouchGestureState::Spent(pinch.other(event.id).unwrap());
+                }
+                TouchGestureState::Spent(id) if id == event.id => {}
                 other => self.state = other,
             },
             TouchPhase::Cancelled => match mem::replace(&mut self.state, TouchGestureState::Idle) {
@@ -980,10 +1044,49 @@ impl TouchGestureRecognizer {
                         position: event.position,
                     }));
                 }
+                TouchGestureState::Pinching(pinch) if pinch.other(event.id).is_some() => {
+                    recognized.push(pinch.event(TouchPhase::Cancelled, 0.));
+                    self.state = TouchGestureState::Spent(pinch.other(event.id).unwrap());
+                }
+                TouchGestureState::Spent(id) if id == event.id => {}
                 other => self.state = other,
             },
         }
         recognized
+    }
+
+    /// Turns a touch landing while another is pending or panning into a
+    /// pinch, ending the pan first.
+    fn start_pinch(
+        &mut self,
+        event: &TouchEvent,
+        recognized: &mut SmallVec<[RecognizedTouchGesture; 2]>,
+    ) -> Option<Pinch> {
+        let first = match &self.state {
+            TouchGestureState::Pending { touch, .. }
+            | TouchGestureState::Panning { touch, .. }
+            | TouchGestureState::Caught(touch)
+                if touch.id != event.id =>
+            {
+                touch
+            }
+            _ => return None,
+        };
+        if !matches!(self.state, TouchGestureState::Pending { .. }) {
+            recognized.push(RecognizedTouchGesture::Scroll(scroll_event(
+                first.start_position,
+                Point::default(),
+                TouchPhase::Ended,
+            )));
+        }
+        let pinch = Pinch {
+            touches: [(first.id, first.last_position), (event.id, event.position)],
+            distance: 0.,
+        };
+        Some(Pinch {
+            distance: pinch.distance(),
+            ..pinch
+        })
     }
 
     pub(crate) fn pending_long_press(&self) -> Option<(TouchId, Duration)> {
@@ -1988,39 +2091,31 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_touches_are_ignored_while_one_is_active() {
+    fn a_third_touch_is_ignored_while_two_pinch() {
         let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
         let now = Instant::now();
-
-        recognizer.handle_event_at(
-            &touch_event(TouchId(1), TouchPhase::Started, 100., 100.),
-            now,
-        );
-        let recognized = recognizer.handle_event_at(
-            &touch_event(TouchId(2), TouchPhase::Started, 200., 200.),
-            now + Duration::from_millis(8),
-        );
-        assert!(recognized.is_empty());
-        let recognized = recognizer.handle_event_at(
-            &touch_event(TouchId(2), TouchPhase::Moved, 200., 300.),
-            now + Duration::from_millis(16),
-        );
-        assert!(recognized.is_empty());
-        let recognized = recognizer.handle_event_at(
-            &touch_event(TouchId(2), TouchPhase::Ended, 200., 300.),
-            now + Duration::from_millis(24),
-        );
-        assert!(recognized.is_empty());
-
-        // The first touch still resolves normally.
-        let recognized = recognizer.handle_event_at(
-            &touch_event(TouchId(1), TouchPhase::Moved, 100., 150.),
-            now + Duration::from_millis(32),
-        );
-        let [RecognizedTouchGesture::Scroll(scroll)] = recognized.as_slice() else {
-            panic!("expected scroll, got {recognized:?}");
+        let mut at = |id, phase, x, y, ms| {
+            recognizer.handle_event_at(
+                &touch_event(TouchId(id), phase, x, y),
+                now + Duration::from_millis(ms),
+            )
         };
-        assert_eq!(scroll.touch_phase, TouchPhase::Started);
+
+        at(1, TouchPhase::Started, 100., 100., 0);
+        at(2, TouchPhase::Started, 200., 200., 8);
+        assert!(at(3, TouchPhase::Started, 300., 300., 16).is_empty());
+        assert!(at(3, TouchPhase::Moved, 300., 400., 24).is_empty());
+        assert!(at(3, TouchPhase::Ended, 300., 400., 32).is_empty());
+
+        // The two pinching touches carry on.
+        let recognized = at(2, TouchPhase::Moved, 250., 250., 40);
+        assert!(matches!(
+            recognized.as_slice(),
+            [RecognizedTouchGesture::Pinch(PinchEvent {
+                phase: TouchPhase::Moved,
+                ..
+            })]
+        ));
     }
 
     #[test]
@@ -2235,6 +2330,82 @@ mod tests {
                 ..
             })]
         ));
+    }
+
+    #[test]
+    fn second_touch_pinches_until_either_lifts() {
+        let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
+        let now = Instant::now();
+        let mut at = |id, phase, x, y, ms| {
+            recognizer.handle_event_at(
+                &touch_event(TouchId(id), phase, x, y),
+                now + Duration::from_millis(ms),
+            )
+        };
+        let pinch = |gestures: SmallVec<[RecognizedTouchGesture; 2]>| match gestures.as_slice() {
+            [RecognizedTouchGesture::Pinch(pinch)] => (pinch.phase, pinch.delta, pinch.position),
+            other => panic!("expected one pinch, got {other:?}"),
+        };
+
+        // The first touch pans, then a second lands: the pan ends, the pinch starts.
+        at(1, TouchPhase::Started, 100., 100., 0);
+        at(1, TouchPhase::Moved, 100., 140., 10);
+        let started = at(2, TouchPhase::Started, 100., 240., 20);
+        assert!(matches!(
+            started.as_slice(),
+            [
+                RecognizedTouchGesture::Scroll(ScrollEvent {
+                    touch_phase: TouchPhase::Ended,
+                    ..
+                }),
+                RecognizedTouchGesture::Pinch(PinchEvent {
+                    phase: TouchPhase::Started,
+                    ..
+                })
+            ]
+        ));
+
+        // Spreading from 100 px apart to 150 zooms by half, about the middle.
+        let (phase, delta, center) = pinch(at(2, TouchPhase::Moved, 100., 290., 30));
+        assert_eq!(phase, TouchPhase::Moved);
+        assert!((delta - 0.5).abs() < 1e-4, "{delta}");
+        assert_eq!(center, point(px(100.), px(215.)));
+        let (_, delta, _) = pinch(at(1, TouchPhase::Moved, 100., 215., 40));
+        assert!((delta - (75. / 150. - 1.)).abs() < 1e-4, "{delta}");
+
+        // Lifting one ends it; the other then does nothing until it lifts.
+        assert_eq!(
+            pinch(at(1, TouchPhase::Ended, 100., 215., 50)).0,
+            TouchPhase::Ended
+        );
+        assert!(at(2, TouchPhase::Moved, 100., 400., 60).is_empty());
+        assert!(at(2, TouchPhase::Ended, 100., 400., 70).is_empty());
+
+        // And the next touch is an ordinary tap.
+        at(3, TouchPhase::Started, 10., 10., 80);
+        assert!(matches!(
+            at(3, TouchPhase::Ended, 10., 10., 90).as_slice(),
+            [RecognizedTouchGesture::Tap { .. }]
+        ));
+    }
+
+    #[test]
+    fn second_touch_during_a_drag_is_ignored() {
+        let mut recognizer = TouchGestureRecognizer::new(GestureTuning::default());
+        let now = Instant::now();
+        recognizer.handle_event_at(&touch_event(TouchId(1), TouchPhase::Started, 0., 0.), now);
+        recognizer.offer_touch_drag(TouchId(1));
+        recognizer.resolve_touch_drag(true);
+        assert!(
+            recognizer
+                .handle_event_at(&touch_event(TouchId(2), TouchPhase::Started, 0., 100.), now)
+                .is_empty()
+        );
+        assert!(
+            recognizer
+                .handle_event_at(&touch_event(TouchId(2), TouchPhase::Moved, 0., 200.), now)
+                .is_empty()
+        );
     }
 
     #[test]

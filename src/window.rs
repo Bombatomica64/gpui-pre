@@ -6199,6 +6199,11 @@ impl Window {
             RecognizedTouchGesture::MouseDrag(touch_drag) => {
                 self.dispatch_touch_drag_as_mouse(touch_drag, cx);
             }
+            RecognizedTouchGesture::Pinch(pinch) => {
+                self.mouse_position = pinch.position;
+                cx.propagate_event = true;
+                self.dispatch_mouse_event(&pinch, cx);
+            }
         }
     }
 
@@ -9928,6 +9933,59 @@ mod tests {
         assert!(!has_active_drag(window, cx));
         assert_eq!(rows_offset(cx), scrolled);
         assert!(log.borrow().drops.is_empty());
+    }
+
+    #[gpui::test]
+    fn two_touches_pinch_an_on_pinch_element(cx: &mut TestAppContext) {
+        struct PinchView(Rc<RefCell<Vec<(TouchPhase, f32)>>>);
+        impl Render for PinchView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let log = self.0.clone();
+                div()
+                    .id("zoomable")
+                    .size(px(300.))
+                    .on_pinch(move |event, _, _| log.borrow_mut().push((event.phase, event.delta)))
+            }
+        }
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let log = log.clone();
+            move |_, _| PinchView(log)
+        });
+        let touch = |cx: &mut TestAppContext, id, phase, y| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(
+                    TouchEvent {
+                        id: TouchId(id),
+                        phase,
+                        position: point(px(100.), px(y)),
+                        predicted_position: None,
+                        force: None,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        };
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        touch(cx, 1, TouchPhase::Started, 100.);
+        touch(cx, 2, TouchPhase::Started, 200.);
+        touch(cx, 2, TouchPhase::Moved, 250.);
+        touch(cx, 2, TouchPhase::Ended, 250.);
+        touch(cx, 1, TouchPhase::Ended, 100.);
+
+        assert_eq!(
+            *log.borrow(),
+            [
+                (TouchPhase::Started, 0.),
+                (TouchPhase::Moved, 0.5),
+                (TouchPhase::Ended, 0.)
+            ]
+        );
     }
 
     #[gpui::test]
