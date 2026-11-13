@@ -21,11 +21,10 @@ use crate::{
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, Task, TextInputConfiguration, TextInputStateChange,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
-TouchDragEvent,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TouchDragEvent,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
+    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -8253,14 +8252,13 @@ mod tests {
     use crate::{
         AnyWindowHandle, AppContext as _, BackGestureEvent, BackGesturePhase, Bounds, ContentMask,
         Context, CursorStyle, DispatchPhase, DragMoveEvent, Empty, ExternalDragPayload,
-        ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle, InputEvent as _,
+        ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle, GestureTuning, InputEvent as _,
         InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke, LongPressEvent, MouseButton,
         MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, PlatformInput, Point,
-        Render, RequestFrameOptions, ScaledPixels, StatefulInteractiveElement as _, Styled,
-        TestAppContext, ThermalState, TouchDragEvent, TouchEvent, TouchId, TouchPhase, Underline,
-        UnderlineStyle, Window, WindowAppearance, WindowOptions, canvas, div, hsla, point, px,
-        size,
-GestureTuning, ScrollHandle,
+        Render, RequestFrameOptions, ScaledPixels, ScrollHandle, StatefulInteractiveElement as _,
+        Styled, TestAppContext, ThermalState, TouchDragEvent, TouchEvent, TouchId, TouchPhase,
+        Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions, canvas, div, hsla,
+        point, px, size,
     };
 
     #[gpui::test]
@@ -9728,17 +9726,21 @@ GestureTuning, ScrollHandle,
         log: Rc<RefCell<DragLog>>,
         rows: ScrollHandle,
         plain: ScrollHandle,
+        /// Whether the rows are drag handles.
+        handles: bool,
     }
 
     impl TouchDragView {
         fn draggable(&self, id: usize) -> impl IntoElement {
             let log = self.log.clone();
             let click_log = self.log.clone();
-            div()
-                .id(id)
-                .flex_none()
-                .size(px(50.))
-                .on_drag(DraggedRow(id), |row, _, _, cx| cx.new(|_| row.clone()))
+            let row = div().id(id).flex_none().size(px(50.));
+            let row = if self.handles && id > 0 {
+                row.drag_handle()
+            } else {
+                row
+            };
+            row.on_drag(DraggedRow(id), |row, _, _, cx| cx.new(|_| row.clone()))
                 .on_drag_move::<DraggedRow>(move |event, _, _| {
                     log.borrow_mut().moves.push(event.event.position)
                 })
@@ -9793,6 +9795,13 @@ GestureTuning, ScrollHandle,
     fn add_touch_drag_view(
         cx: &mut TestAppContext,
     ) -> (crate::WindowHandle<TouchDragView>, Rc<RefCell<DragLog>>) {
+        add_touch_drag_view_with(cx, false)
+    }
+
+    fn add_touch_drag_view_with(
+        cx: &mut TestAppContext,
+        handles: bool,
+    ) -> (crate::WindowHandle<TouchDragView>, Rc<RefCell<DragLog>>) {
         let log = Rc::new(RefCell::new(DragLog::default()));
         let window = cx.add_window({
             let log = log.clone();
@@ -9800,6 +9809,7 @@ GestureTuning, ScrollHandle,
                 log,
                 rows: ScrollHandle::new(),
                 plain: ScrollHandle::new(),
+                handles,
             }
         });
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
@@ -9918,6 +9928,22 @@ GestureTuning, ScrollHandle,
         assert!(!has_active_drag(window, cx));
         assert_eq!(rows_offset(cx), scrolled);
         assert!(log.borrow().drops.is_empty());
+    }
+
+    #[gpui::test]
+    fn drag_handle_inside_scroll_container_drags_along_its_axis(cx: &mut TestAppContext) {
+        let (window, log) = add_touch_drag_view_with(cx, true);
+        let rows_offset =
+            |cx: &mut TestAppContext| window.update(cx, |view, _, _| view.rows.offset()).unwrap();
+
+        touch_at(window, cx, TouchPhase::Started, 10., 160.);
+        touch_at(window, cx, TouchPhase::Moved, 10., 130.);
+        assert!(has_active_drag(window, cx));
+        touch_at(window, cx, TouchPhase::Moved, 10., 120.);
+        assert_eq!(log.borrow().moves.last(), Some(&point(px(10.), px(120.))));
+        touch_at(window, cx, TouchPhase::Ended, 10., 120.);
+        assert!(!has_active_drag(window, cx));
+        assert_eq!(rows_offset(cx).y, px(0.));
     }
 
     #[gpui::test]

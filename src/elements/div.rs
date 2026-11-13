@@ -24,8 +24,8 @@ use crate::{
     ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
     PinchEvent, Pixels, Point, Render, ScrollEvent, SharedString, Size, Style, StyleRefinement,
-    Styled, Task, TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
-TouchDragEvent,
+    Styled, Task, TooltipId, TouchDragEvent, TouchPhase, Visibility, Window, WindowControlArea,
+    point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -1679,6 +1679,19 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Marks this element as a drag handle, like a splitter or a column resize handle: a touch
+    /// drag starting on it drags it as soon as it leaves the touch slop, even along the axes its
+    /// scroll containers scroll. Without it, a pan along those axes scrolls, and the element
+    /// drags after a long press or a pan across them, as rows of a scrolling list should.
+    /// Only matters together with [`Self::on_drag`]; mouse input is not affected.
+    fn drag_handle(mut self) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().drag_handle = true;
+        self
+    }
+
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
     /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
     /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
@@ -2258,6 +2271,7 @@ pub struct Interactivity {
     pub(crate) click_listeners: Vec<ClickListener>,
     pub(crate) aux_click_listeners: Vec<ClickListener>,
     pub(crate) drag_listener: Option<DragListener>,
+    pub(crate) drag_handle: bool,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) hover_listener_mode: HoverListenerMode,
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
@@ -3055,7 +3069,13 @@ impl Interactivity {
                     // Let a touch starting here drag this element through the
                     // mouse drag path, unless an element in front claimed it.
                     let hitbox = hitbox.clone();
-                    let scrollable_axes = window.scrollable_axes;
+                    // A drag handle drags at once, even along the axes its
+                    // scroll containers scroll.
+                    let scrollable_axes = if self.drag_handle {
+                        Point::default()
+                    } else {
+                        window.scrollable_axes
+                    };
                     window.on_mouse_event(move |event: &TouchDragEvent, phase, window, _cx| {
                         if phase == DispatchPhase::Bubble
                             && event.phase == TouchPhase::Started
